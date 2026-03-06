@@ -159,9 +159,9 @@ def main():
     parser = argparse.ArgumentParser(description="CNC MCP Server")
     parser.add_argument(
         "--transport",
-        choices=["stdio", "sse"],
+        choices=["stdio", "sse", "http"],
         default="stdio",
-        help="MCP transport: stdio (local) or sse (network, for Mini deployment)",
+        help="MCP transport: stdio (local), sse, or http (network, for Mini deployment)",
     )
     parser.add_argument(
         "--host",
@@ -176,11 +176,17 @@ def main():
     )
     args = parser.parse_args()
 
-    if args.transport == "sse":
-        print(f"Starting CNC MCP server (SSE) on {args.host}:{args.port}", flush=True)
+    if args.transport in ("sse", "http"):
+        print(f"Starting CNC MCP server ({args.transport.upper()}) on {args.host}:{args.port}", flush=True)
+        from mcp.server.transport_security import TransportSecuritySettings
         mcp.settings.host = args.host
         mcp.settings.port = args.port
-        mcp.run(transport="sse")
+        # Disable localhost-only DNS rebinding protection so LAN clients can connect
+        mcp.settings.transport_security = TransportSecuritySettings(
+            enable_dns_rebinding_protection=False
+        )
+        transport = "streamable-http" if args.transport == "http" else "sse"
+        mcp.run(transport=transport)
     else:
         mcp.run(transport="stdio")
 
