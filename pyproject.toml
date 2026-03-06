@@ -1,0 +1,8 @@
+[project]
+name = "cnc-mcp"
+version = "0.1.0"
+description = "MCP server for CNC machine control via GRBL"
+requires-python = ">=3.10"
+
+[project.scripts]
+cnc-mcp = "cnc_mcp_server:main"

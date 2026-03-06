@@ -1,0 +1,420 @@
+"""
+GRBL serial protocol handler.
+
+Design:
+- Dedicated reader thread parses all incoming serial data
+- Status responses (<...>) update cached MachineStatus
+- ok/error responses go into a queue consumed by the streaming thread
+- Single write lock prevents concurrent writes from multiple threads
+- run_file() streams in a background thread; use get_status() to poll progress
+"""
+
+import os
+import queue
+import threading
+import time
+from dataclasses import dataclass, field
+from typing import Optional
+
+import serial
+import serial.tools.list_ports
+
+
+# ---------------------------------------------------------------------------
+# Data classes
+# ---------------------------------------------------------------------------
+
+@dataclass
+class MachineStatus:
+    state: str = "Disconnected"
+    mpos: dict = field(default_factory=lambda: {"x": 0.0, "y": 0.0, "z": 0.0})
+    wpos: dict = field(default_factory=lambda: {"x": 0.0, "y": 0.0, "z": 0.0})
+    feed: float = 0.0
+    spindle: float = 0.0
+
+
+@dataclass
+class JobStatus:
+    running: bool = False
+    filepath: str = ""
+    total_lines: int = 0
+    sent_lines: int = 0
+    complete: bool = False
+    error: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# Controller
+# ---------------------------------------------------------------------------
+
+class GRBLController:
+    BAUD_RATE = 115200
+    RX_BUFFER_SIZE = 127   # GRBL's RX buffer (bytes)
+    STATUS_INTERVAL = 0.2  # seconds between status polls
+
+    def __init__(self):
+        self._serial: Optional[serial.Serial] = None
+        self._write_lock = threading.Lock()       # serialises writes
+        self._status = MachineStatus()
+        self._status_lock = threading.Lock()
+        self._response_q: queue.Queue = queue.Queue()
+
+        self._connected = False
+        self._port: Optional[str] = None
+
+        self._stop_event = threading.Event()
+        self._job_stop = threading.Event()
+        self._job = JobStatus()
+
+        self._reader_thread: Optional[threading.Thread] = None
+        self._poller_thread: Optional[threading.Thread] = None
+        self._stream_thread: Optional[threading.Thread] = None
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def list_ports(self) -> list[str]:
+        return [p.device for p in serial.tools.list_ports.comports()]
+
+    def connect(self, port: str) -> dict:
+        if self._connected:
+            self.disconnect()
+
+        try:
+            ser = serial.Serial(port, self.BAUD_RATE, timeout=1)
+            time.sleep(2)          # GRBL resets on DTR; wait for startup
+            ser.reset_input_buffer()
+
+            # Collect startup banner (e.g. "Grbl 1.1h ['$' for help]")
+            startup_lines = []
+            deadline = time.time() + 3
+            while time.time() < deadline:
+                if ser.in_waiting:
+                    line = ser.readline().decode("utf-8", errors="replace").strip()
+                    if line:
+                        startup_lines.append(line)
+                    if any("Grbl" in l for l in startup_lines):
+                        break
+                time.sleep(0.05)
+
+            self._serial = ser
+            self._connected = True
+            self._port = port
+
+            self._stop_event.clear()
+            self._reader_thread = threading.Thread(
+                target=self._reader, name="grbl-reader", daemon=True)
+            self._poller_thread = threading.Thread(
+                target=self._poller, name="grbl-poller", daemon=True)
+            self._reader_thread.start()
+            self._poller_thread.start()
+
+            return {"ok": True, "port": port,
+                    "startup": " | ".join(startup_lines)}
+
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def disconnect(self) -> dict:
+        self._stop_event.set()
+        self._job_stop.set()
+
+        for t in (self._reader_thread, self._poller_thread, self._stream_thread):
+            if t and t.is_alive():
+                t.join(timeout=2)
+
+        with self._write_lock:
+            if self._serial:
+                try:
+                    self._serial.close()
+                except Exception:
+                    pass
+                self._serial = None
+
+        self._connected = False
+        self._port = None
+        self._status = MachineStatus()
+        self._job = JobStatus()
+        return {"ok": True}
+
+    def get_status(self) -> dict:
+        if not self._connected:
+            return {"connected": False, "state": "Disconnected"}
+
+        # Request a fresh status; reader thread will update cache
+        self._write(b"?")
+        time.sleep(0.15)
+
+        with self._status_lock:
+            s = self._status
+
+        result = {
+            "connected": True,
+            "port": self._port,
+            "state": s.state,
+            "mpos": s.mpos,
+            "wpos": s.wpos,
+            "feed": s.feed,
+            "spindle": s.spindle,
+        }
+
+        j = self._job
+        if j.running or j.complete or j.error:
+            pct = (j.sent_lines / j.total_lines * 100) if j.total_lines else 0
+            result["job"] = {
+                "running": j.running,
+                "file": os.path.basename(j.filepath),
+                "lines": f"{j.sent_lines}/{j.total_lines}",
+                "percent": round(pct, 1),
+                "complete": j.complete,
+                "error": j.error,
+            }
+
+        return result
+
+    def run_file(self, filepath: str) -> dict:
+        if not self._connected:
+            return {"ok": False, "error": "Not connected"}
+        if self._job.running:
+            return {"ok": False, "error": "A job is already running"}
+        if not os.path.exists(filepath):
+            return {"ok": False, "error": f"File not found: {filepath}"}
+
+        self._job_stop.clear()
+        self._job = JobStatus(filepath=filepath, running=True)
+
+        self._stream_thread = threading.Thread(
+            target=self._stream_file, args=(filepath,),
+            name="grbl-stream", daemon=True)
+        self._stream_thread.start()
+
+        return {"ok": True,
+                "message": f"Streaming started: {os.path.basename(filepath)}"}
+
+    def pause(self) -> dict:
+        self._write(b"!")
+        return {"ok": True}
+
+    def resume(self) -> dict:
+        self._write(b"~")
+        return {"ok": True}
+
+    def stop(self) -> dict:
+        self._job_stop.set()
+        self._write(b"\x18")          # GRBL soft reset
+        time.sleep(0.5)
+        with self._write_lock:
+            if self._serial:
+                self._serial.reset_input_buffer()
+        # Drain response queue
+        while not self._response_q.empty():
+            try:
+                self._response_q.get_nowait()
+            except queue.Empty:
+                break
+        self._job = JobStatus()
+        return {"ok": True}
+
+    def jog(self, axis: str, distance_mm: float, feed_mmpm: float = 500.0) -> dict:
+        if not self._connected:
+            return {"ok": False, "error": "Not connected"}
+        axis = axis.upper()
+        if axis not in ("X", "Y", "Z"):
+            return {"ok": False, "error": "Axis must be X, Y, or Z"}
+        cmd = f"$J=G91 G21 {axis}{distance_mm:.3f} F{feed_mmpm:.0f}\n"
+        self._write(cmd.encode())
+        return {"ok": True, "command": cmd.strip()}
+
+    def home(self) -> dict:
+        if not self._connected:
+            return {"ok": False, "error": "Not connected"}
+        self._write(b"$H\n")
+        return {"ok": True}
+
+    def set_zero(self, axes: Optional[list[str]] = None) -> dict:
+        if not self._connected:
+            return {"ok": False, "error": "Not connected"}
+        if axes is None:
+            axes = ["X", "Y", "Z"]
+        parts = " ".join(f"{a.upper()}0" for a in axes)
+        cmd = f"G10 L20 P1 {parts}\n"
+        self._write(cmd.encode())
+        return {"ok": True, "command": cmd.strip()}
+
+    def send_command(self, command: str) -> dict:
+        if not self._connected:
+            return {"ok": False, "error": "Not connected"}
+        cmd = command.strip() + "\n"
+        self._write(cmd.encode())
+        time.sleep(0.25)
+        # Collect any queued responses
+        responses = []
+        while not self._response_q.empty():
+            try:
+                responses.append(self._response_q.get_nowait())
+            except queue.Empty:
+                break
+        return {"ok": True, "responses": responses}
+
+    # ------------------------------------------------------------------
+    # Internal threads
+    # ------------------------------------------------------------------
+
+    def _write(self, data: bytes):
+        with self._write_lock:
+            if self._serial and self._connected:
+                try:
+                    self._serial.write(data)
+                except Exception:
+                    pass
+
+    def _reader(self):
+        """Reads all incoming serial data; routes status vs ok/error."""
+        buf = ""
+        while not self._stop_event.is_set():
+            try:
+                with self._write_lock:
+                    ser = self._serial
+                if ser is None:
+                    time.sleep(0.01)
+                    continue
+
+                waiting = ser.in_waiting
+                if waiting:
+                    chunk = ser.read(waiting)
+                    buf += chunk.decode("utf-8", errors="replace")
+                    while "\n" in buf:
+                        line, buf = buf.split("\n", 1)
+                        line = line.strip()
+                        if not line:
+                            continue
+                        if line.startswith("<") and line.endswith(">"):
+                            parsed = self._parse_status(line)
+                            if parsed:
+                                with self._status_lock:
+                                    self._status = parsed
+                        elif line.startswith("ok") or line.startswith("error"):
+                            self._response_q.put(line)
+                        elif line.startswith("ALARM"):
+                            with self._status_lock:
+                                self._status.state = line
+                        # startup / info lines silently dropped
+                else:
+                    time.sleep(0.005)
+            except Exception:
+                time.sleep(0.01)
+
+    def _poller(self):
+        """Sends '?' periodically to keep status cache fresh."""
+        while not self._stop_event.is_set():
+            self._write(b"?")
+            time.sleep(self.STATUS_INTERVAL)
+
+    def _stream_file(self, filepath: str):
+        """Buffer-aware GRBL file streaming (runs in background thread)."""
+        try:
+            with open(filepath) as f:
+                lines = []
+                for raw in f:
+                    line = raw.strip()
+                    if ";" in line:
+                        line = line[:line.index(";")].strip()
+                    if line and not line.startswith("(") and line != "%":
+                        lines.append(line.upper())
+
+            self._job.total_lines = len(lines)
+            buf_sizes: list[int] = []   # byte sizes of lines currently in GRBL buffer
+            sent_idx = 0
+            errors: list[str] = []
+
+            while sent_idx < len(lines) and not self._job_stop.is_set():
+                line = lines[sent_idx]
+                line_bytes = len(line) + 1   # +1 for \n
+
+                # Drain responses until there's buffer room
+                while (sum(buf_sizes) + line_bytes > self.RX_BUFFER_SIZE
+                       and not self._job_stop.is_set()):
+                    try:
+                        resp = self._response_q.get(timeout=10.0)
+                        if buf_sizes:
+                            buf_sizes.pop(0)
+                        if resp.startswith("error"):
+                            errors.append(f"line {self._job.sent_lines}: {resp}")
+                    except queue.Empty:
+                        # Machine stopped responding — abort
+                        self._job.error = "Timeout waiting for GRBL response"
+                        self._job.running = False
+                        return
+
+                if self._job_stop.is_set():
+                    break
+
+                self._write((line + "\n").encode())
+                buf_sizes.append(line_bytes)
+                sent_idx += 1
+                self._job.sent_lines = sent_idx
+
+            # Drain remaining acks
+            while buf_sizes and not self._job_stop.is_set():
+                try:
+                    resp = self._response_q.get(timeout=10.0)
+                    if buf_sizes:
+                        buf_sizes.pop(0)
+                    if resp.startswith("error"):
+                        errors.append(resp)
+                except queue.Empty:
+                    break
+
+            if errors:
+                self._job.error = "; ".join(errors[:5])
+            self._job.complete = not self._job_stop.is_set()
+            self._job.running = False
+
+        except Exception as e:
+            self._job.error = str(e)
+            self._job.running = False
+
+    # ------------------------------------------------------------------
+    # Parsing
+    # ------------------------------------------------------------------
+
+    def _parse_status(self, line: str) -> Optional[MachineStatus]:
+        """Parse <State|MPos:x,y,z|FS:f,s|WCO:x,y,z> response."""
+        if not (line.startswith("<") and line.endswith(">")):
+            return None
+        s = MachineStatus()
+        parts = line[1:-1].split("|")
+        s.state = parts[0]
+        wco = None
+        for part in parts[1:]:
+            if ":" not in part:
+                continue
+            key, val = part.split(":", 1)
+            coords = val.split(",")
+            if key == "MPos" and len(coords) == 3:
+                s.mpos = {k: float(v) for k, v in zip("xyz", coords)}
+            elif key == "WPos" and len(coords) == 3:
+                s.wpos = {k: float(v) for k, v in zip("xyz", coords)}
+            elif key == "WCO" and len(coords) == 3:
+                wco = [float(v) for v in coords]
+            elif key == "FS" and len(coords) >= 2:
+                s.feed, s.spindle = float(coords[0]), float(coords[1])
+            elif key == "F" and coords:
+                s.feed = float(coords[0])
+        # WCO mode: wpos = mpos - wco
+        if wco and s.mpos:
+            s.wpos = {
+                "x": round(s.mpos["x"] - wco[0], 3),
+                "y": round(s.mpos["y"] - wco[1], 3),
+                "z": round(s.mpos["z"] - wco[2], 3),
+            }
+        return s
+
+
+# Module-level singleton
+_controller = GRBLController()
+
+
+def get_controller() -> GRBLController:
+    return _controller
