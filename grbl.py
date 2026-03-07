@@ -69,10 +69,18 @@ class GRBLController:
         self._reader_thread: Optional[threading.Thread] = None
         self._poller_thread: Optional[threading.Thread] = None
         self._stream_thread: Optional[threading.Thread] = None
+        self._job_complete_cb = None   # callable(total, sent, success, error)
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    def set_job_complete_callback(self, cb):
+        """Register a callback fired when the current streaming job finishes.
+        Signature: cb(total_lines, sent_lines, success: bool, error: str|None)
+        One-shot: cleared after each job completes.
+        """
+        self._job_complete_cb = cb
 
     def list_ports(self) -> list[str]:
         return [p.device for p in serial.tools.list_ports.comports()]
@@ -242,6 +250,54 @@ class GRBLController:
         self._write(cmd.encode())
         return {"ok": True, "command": cmd.strip()}
 
+    def probe_z(self, puck_mm: float = 1.5, max_travel_mm: float = 20.0,
+                feed_mmpm: float = 50.0) -> dict:
+        """
+        Run a Z-probe cycle and set work Z to the puck thickness.
+
+        Sequence:
+          G38.2 Z-{max_travel} F{feed}   — probe toward workpiece
+          G92 Z{puck_mm}                  — set Z = puck thickness (tool offset)
+          G0 Z5                           — lift clear
+
+        The machine must be connected and idle.
+        puck_mm: thickness of the probe puck in mm (sets the Z work offset).
+        """
+        if not self._connected:
+            return {"ok": False, "error": "Not connected"}
+        with self._status_lock:
+            state = self._status.state
+        if state not in ("Idle",):
+            return {"ok": False, "error": f"Machine not idle (state={state})"}
+
+        # Probe move — wait for completion (can take several seconds)
+        probe_cmd = f"G38.2 Z-{max_travel_mm:.1f} F{feed_mmpm:.0f}\n"
+        self._write(probe_cmd.encode())
+        try:
+            resp = self._response_q.get(timeout=60.0)
+        except queue.Empty:
+            return {"ok": False, "error": "Probe timed out — no response from GRBL"}
+        if resp.startswith("error"):
+            return {"ok": False, "error": f"Probe failed: {resp}"}
+
+        # Set Z work coordinate to puck thickness
+        offset_cmd = f"G92 Z{puck_mm:.3f}\n"
+        self._write(offset_cmd.encode())
+        try:
+            self._response_q.get(timeout=5.0)
+        except queue.Empty:
+            pass
+
+        # Lift clear of puck
+        self._write(b"G0 Z5\n")
+        try:
+            self._response_q.get(timeout=10.0)
+        except queue.Empty:
+            pass
+
+        return {"ok": True, "puck_mm": puck_mm,
+                "message": f"Z probed, offset set to {puck_mm}mm, lifted to Z5"}
+
     def send_command(self, command: str) -> dict:
         if not self._connected:
             return {"ok": False, "error": "Not connected"}
@@ -371,9 +427,20 @@ class GRBLController:
             self._job.complete = not self._job_stop.is_set()
             self._job.running = False
 
+            cb = self._job_complete_cb
+            self._job_complete_cb = None
+            if cb:
+                cb(self._job.total_lines, self._job.sent_lines,
+                   self._job.complete and not self._job.error,
+                   self._job.error)
+
         except Exception as e:
             self._job.error = str(e)
             self._job.running = False
+            cb = self._job_complete_cb
+            self._job_complete_cb = None
+            if cb:
+                cb(self._job.total_lines, self._job.sent_lines, False, str(e))
 
     # ------------------------------------------------------------------
     # Parsing

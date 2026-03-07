@@ -16,12 +16,15 @@ import sys
 from mcp.server.fastmcp import FastMCP
 
 from grbl import get_controller
+import journal as _journal_mod
 
 mcp = FastMCP(
     "cnc-mcp",
     instructions="CNC machine control via GRBL serial protocol",
 )
 grbl = get_controller()
+# Journal is initialised in main() once CLI args are parsed
+journal = None
 
 
 # ---------------------------------------------------------------------------
@@ -36,12 +39,16 @@ def list_serial_ports() -> dict:
 
 
 @mcp.tool()
-def connect(port: str) -> dict:
+def connect(port: str) -> dict:  # noqa: F811 (shadows outer name intentionally)
     """
     Connect to the CNC machine on the given serial port.
     Use list_serial_ports first to find the correct port (e.g. /dev/tty.usbserial-...).
     """
-    return grbl.connect(port)
+    result = grbl.connect(port)
+    if result.get("ok"):
+        journal.log_event("connect", {"port": port,
+                                      "startup": result.get("startup", "")})
+    return result
 
 
 @mcp.tool()
@@ -66,7 +73,16 @@ def run_file(filepath: str) -> dict:
     Returns immediately — use get_status() to monitor progress.
     The machine must be connected, idle, and the file must exist on this machine.
     """
-    return grbl.run_file(filepath)
+    status = grbl.get_status()
+    wpos = status.get("wpos")
+    result = grbl.run_file(filepath)
+    if result.get("ok"):
+        job_id = journal.job_start(filepath, wpos)
+        grbl.set_job_complete_callback(
+            lambda total, sent, success, error:
+                journal.job_complete(job_id, total, sent, success, error)
+        )
+    return result
 
 
 @mcp.tool()
@@ -110,7 +126,10 @@ def home() -> dict:
     Run the homing cycle ($H). Requires homing switches to be installed and enabled.
     Machine moves to home position and sets machine coordinates to zero.
     """
-    return grbl.home()
+    result = grbl.home()
+    if result.get("ok"):
+        journal.log_event("home")
+    return result
 
 
 @mcp.tool()
@@ -120,7 +139,14 @@ def set_zero(axes: list[str] | None = None) -> dict:
     axes: list such as ["X", "Y", "Z"] or ["Z"] for Z-only. Defaults to all three.
     This sets the work offset (G10 L20 P1), not the machine coordinates.
     """
-    return grbl.set_zero(axes)
+    result = grbl.set_zero(axes)
+    if result.get("ok"):
+        status = grbl.get_status()
+        journal.log_event("zero", {
+            "axes": axes or ["X", "Y", "Z"],
+            "wpos": status.get("wpos"),
+        })
+    return result
 
 
 @mcp.tool()
@@ -152,6 +178,60 @@ def send_command(command: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Journal tools
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def journal_list_jobs(limit: int = 20) -> dict:
+    """
+    List recent CNC jobs from the journal, newest first.
+    Returns filename, start/end times, line counts, success/failure, and any notes.
+    """
+    return {"jobs": journal.list_jobs(limit)}
+
+
+@mcp.tool()
+def journal_get_job(job_id: int) -> dict:
+    """
+    Get full details for a specific job, including nearby events (home, zero, probe, alarm).
+    """
+    job = journal.get_job(job_id)
+    if job is None:
+        return {"ok": False, "error": f"Job {job_id} not found"}
+    return {"ok": True, "job": job}
+
+
+@mcp.tool()
+def journal_add_note(job_id: int, note: str) -> dict:
+    """
+    Add a note to a job. Can be called any time — immediately after a job or days later.
+    Notes are appended with a timestamp; existing notes are preserved.
+    Use this to record what was cut, material, tool, outcome, or anything else.
+    """
+    ok = journal.add_note(job_id, note)
+    if not ok:
+        return {"ok": False, "error": f"Job {job_id} not found"}
+    return {"ok": True, "job_id": job_id}
+
+
+@mcp.tool()
+def journal_stats() -> dict:
+    """
+    Summary statistics: total jobs run, success/failure counts, total machine time.
+    """
+    return journal.stats()
+
+
+@mcp.tool()
+def journal_list_events(limit: int = 50, event_type: str | None = None) -> dict:
+    """
+    List recent machine events (connect, home, zero, probe, alarm).
+    Optionally filter by type.
+    """
+    return {"events": journal.list_events(limit, event_type)}
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -174,7 +254,66 @@ def main():
         default=8765,
         help="Port for SSE server (default: 8765)",
     )
+    parser.add_argument(
+        "--mqtt",
+        metavar="BROKER",
+        default=None,
+        help="MQTT broker host to enable pendant bridge (e.g. 192.168.1.100)",
+    )
+    parser.add_argument(
+        "--mqtt-port",
+        type=int,
+        default=1883,
+        help="MQTT broker port (default: 1883)",
+    )
+    parser.add_argument(
+        "--mqtt-prefix",
+        default="/cova",
+        help="MQTT topic prefix (default: /cova)",
+    )
+    parser.add_argument(
+        "--puck-mm",
+        type=float,
+        default=1.5,
+        help="Z-probe puck thickness in mm (default: 1.5)",
+    )
+    parser.add_argument(
+        "--mariadb-host",
+        default="localhost",
+        help="MariaDB host (default: localhost)",
+    )
+    parser.add_argument(
+        "--mariadb-port",
+        type=int,
+        default=3306,
+        help="MariaDB port (default: 3306)",
+    )
+    parser.add_argument(
+        "--mariadb-db",
+        default="mqtt_log",
+        help="MariaDB database (default: mqtt_log)",
+    )
+    parser.add_argument(
+        "--mariadb-user",
+        default="dashboard",
+        help="MariaDB user — password from macOS Keychain (default: dashboard)",
+    )
     args = parser.parse_args()
+
+    global journal
+    journal = _journal_mod.init(
+        host=args.mariadb_host,
+        port=args.mariadb_port,
+        db=args.mariadb_db,
+        user=args.mariadb_user,
+    )
+
+    if args.mqtt:
+        import mqtt_bridge
+        mqtt_bridge.start(grbl, args.mqtt, port=args.mqtt_port,
+                          prefix=args.mqtt_prefix, puck_mm=args.puck_mm)
+        print(f"MQTT pendant bridge active: {args.mqtt}:{args.mqtt_port} "
+              f"prefix={args.mqtt_prefix} puck={args.puck_mm}mm", flush=True)
 
     if args.transport in ("sse", "http"):
         print(f"Starting CNC MCP server ({args.transport.upper()}) on {args.host}:{args.port}", flush=True)

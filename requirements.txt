@@ -1,2 +1,5 @@
 mcp>=1.0.0
 pyserial>=3.5
+paho-mqtt>=1.6.0
+pymysql>=1.1.0
+keyring>=24.0.0
