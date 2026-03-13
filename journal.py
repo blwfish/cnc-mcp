@@ -258,14 +258,30 @@ class Journal:
             return dict(row) if row else {}
 
 
+class _NullJournal:
+    """Drop-in no-op when MariaDB/keychain isn't available."""
+    def log_event(self, *a, **kw): pass
+    def job_start(self, *a, **kw) -> Optional[int]: return None
+    def job_complete(self, *a, **kw): pass
+    def add_note(self, *a, **kw) -> bool: return False
+    def list_jobs(self, *a, **kw) -> list: return []
+    def get_job(self, *a, **kw) -> Optional[dict]: return None
+    def stats(self, *a, **kw) -> dict: return {}
+    def list_events(self, *a, **kw) -> list: return []
+
+
 # Module-level singleton — initialised by cnc_mcp_server on startup
 _journal: Optional[Journal] = None
 
 
 def init(host: str = "localhost", port: int = 3306,
-         db: str = "mqtt_log", user: str = "dashboard") -> Journal:
+         db: str = "mqtt_log", user: str = "dashboard") -> "Journal | _NullJournal":
     global _journal
-    _journal = Journal(host=host, port=port, db=db, user=user)
+    try:
+        _journal = Journal(host=host, port=port, db=db, user=user)
+    except Exception as e:
+        print(f"Journal disabled ({e})", flush=True)
+        _journal = _NullJournal()
     return _journal
 
 

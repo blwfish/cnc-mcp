@@ -12,10 +12,15 @@ Topics consumed (prefix = /cova by default):
 
 Safety: all commands are silently dropped if the machine is not in Idle state,
 except home ($H) which is allowed from Alarm state.
+
+The MQTT on_message callback never blocks — commands are queued and executed
+by a dedicated worker thread so paho's network loop stays responsive.
 """
 
 import json
 import logging
+import os
+import queue
 import threading
 import time
 
@@ -37,20 +42,20 @@ class MQTTBridge:
         self._prefix = prefix.rstrip("/")
         self._puck_mm = puck_mm
         self._client  = None
-        self._thread  = None
+        self._q: queue.Queue = queue.Queue()
 
     def start(self):
-        """Start the MQTT client in a background thread. Non-blocking."""
-        self._thread = threading.Thread(
-            target=self._run, name="mqtt-bridge", daemon=True)
-        self._thread.start()
+        """Start MQTT client and worker threads. Non-blocking."""
+        threading.Thread(target=self._run,    name="mqtt-bridge",  daemon=True).start()
+        threading.Thread(target=self._worker, name="mqtt-worker",  daemon=True).start()
 
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
 
     def _run(self):
-        client = mqtt.Client(client_id="cnc-mcp-bridge", protocol=mqtt.MQTTv311)
+        client_id = f"cnc-mcp-bridge-{os.getpid()}"
+        client = mqtt.Client(client_id=client_id, protocol=mqtt.MQTTv311)
         client.on_connect    = self._on_connect
         client.on_message    = self._on_message
         client.on_disconnect = self._on_disconnect
@@ -58,12 +63,59 @@ class MQTTBridge:
 
         while True:
             try:
-                log.info(f"Connecting to MQTT broker {self._broker}:{self._port}")
+                log.info(f"Connecting to MQTT broker {self._broker}:{self._port} as {client_id}")
                 client.connect(self._broker, self._port, keepalive=60)
                 client.loop_forever()
+                # loop_forever() returns normally on disconnect (e.g. session taken over).
+                # Always sleep before reconnecting to avoid hammering the broker.
+                log.warning("MQTT loop_forever() returned — reconnecting in 5s")
+                time.sleep(5)
             except Exception as e:
                 log.warning(f"MQTT connection failed: {e} — retrying in 5s")
                 time.sleep(5)
+
+    def _worker(self):
+        """Execute GRBL commands from the queue — never called from paho thread."""
+        while True:
+            suffix, data = self._q.get()
+            try:
+                if suffix == "cnc/jog":
+                    # Coalesce: drain any additional jog messages for the same axis
+                    # already in the queue so we send one combined move, not a replay.
+                    try:
+                        first = json.loads(data)
+                        axis  = str(first["axis"]).upper()
+                        dist  = float(first["dist"])
+                        feed  = float(first.get("feed", 500))
+                    except (KeyError, ValueError, json.JSONDecodeError) as e:
+                        log.warning(f"Bad jog payload: {data!r} ({e})")
+                        continue
+                    while True:
+                        try:
+                            s2, d2 = self._q.get_nowait()
+                        except queue.Empty:
+                            break
+                        if s2 != "cnc/jog":
+                            self._q.put((s2, d2))  # put non-jog back
+                            break
+                        try:
+                            extra = json.loads(d2)
+                            if str(extra["axis"]).upper() == axis:
+                                dist += float(extra["dist"])
+                            else:
+                                self._q.put((s2, d2))  # different axis — keep
+                                break
+                        except Exception:
+                            break
+                    self._handle_jog_direct(axis, dist, feed)
+                elif suffix == "cnc/home":
+                    self._handle_home()
+                elif suffix == "cnc/zero":
+                    self._handle_zero()
+                elif suffix == "cnc/probe":
+                    self._handle_probe()
+            except Exception as e:
+                log.error(f"Error handling {suffix}: {e}")
 
     def _on_connect(self, client, userdata, flags, rc):
         if rc != 0:
@@ -81,44 +133,26 @@ class MQTTBridge:
             log.warning(f"MQTT bridge disconnected (rc={rc})")
 
     def _on_message(self, client, userdata, msg):
+        """Returns immediately — enqueues work for the worker thread."""
         topic   = msg.topic
         payload = msg.payload.decode("utf-8", errors="replace").strip()
         suffix  = topic.removeprefix(self._prefix + "/")
-
         log.debug(f"MQTT rx {topic}: {payload!r}")
-
-        try:
-            if suffix == "cnc/jog":
-                self._handle_jog(payload)
-            elif suffix == "cnc/home":
-                self._handle_home()
-            elif suffix == "cnc/zero":
-                self._handle_zero()
-            elif suffix == "cnc/probe":
-                self._handle_probe()
-        except Exception as e:
-            log.error(f"Error handling {suffix}: {e}")
+        self._q.put((suffix, payload))
 
     # ------------------------------------------------------------------
-    # Handlers
+    # Handlers (run in worker thread, blocking is fine here)
     # ------------------------------------------------------------------
 
     def _machine_state(self) -> str:
-        status = self._grbl.get_status()
-        return status.get("state", "Disconnected")
+        return self._grbl.cached_state()
 
-    def _handle_jog(self, payload: str):
-        try:
-            data = json.loads(payload)
-            axis = str(data["axis"]).upper()
-            dist = float(data["dist"])
-            feed = float(data.get("feed", 500))
-        except (KeyError, ValueError, json.JSONDecodeError) as e:
-            log.warning(f"Bad jog payload: {payload!r} ({e})")
-            return
-
+    def _handle_jog_direct(self, axis: str, dist: float, feed: float):
         state = self._machine_state()
-        if state not in ("Idle", "Jog"):
+        if state == "Alarm":
+            log.info("Alarm state — auto-issuing $X before jog")
+            self._grbl.unlock()
+        elif state not in ("Idle", "Jog"):
             log.debug(f"Dropping jog — machine state={state}")
             return
 

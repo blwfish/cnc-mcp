@@ -146,6 +146,13 @@ class GRBLController:
         self._job = JobStatus()
         return {"ok": True}
 
+    def cached_state(self) -> str:
+        """Return machine state from cache — no serial I/O, safe to call from callbacks."""
+        if not self._connected:
+            return "Disconnected"
+        with self._status_lock:
+            return self._status.state
+
     def get_status(self) -> dict:
         if not self._connected:
             return {"connected": False, "state": "Disconnected"}
@@ -222,6 +229,13 @@ class GRBLController:
             except queue.Empty:
                 break
         self._job = JobStatus()
+        return {"ok": True}
+
+    def unlock(self) -> dict:
+        """Send $X to clear Alarm state. Fire-and-forget, no sleep."""
+        if not self._connected:
+            return {"ok": False, "error": "Not connected"}
+        self._write(b"$X\n")
         return {"ok": True}
 
     def jog(self, axis: str, distance_mm: float, feed_mmpm: float = 500.0) -> dict:
@@ -354,7 +368,7 @@ class GRBLController:
                             self._response_q.put(line)
                         elif line.startswith("ALARM"):
                             with self._status_lock:
-                                self._status.state = line
+                                self._status.state = "Alarm"
                         # startup / info lines silently dropped
                 else:
                     time.sleep(0.005)
