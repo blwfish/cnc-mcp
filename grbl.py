@@ -11,6 +11,7 @@ Design:
 
 import os
 import queue
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -18,6 +19,86 @@ from typing import Optional
 
 import serial
 import serial.tools.list_ports
+
+
+# ---------------------------------------------------------------------------
+# G-code safety limits
+# ---------------------------------------------------------------------------
+
+# Soft travel limits for the Genmitsu 4030 ProVerXL2 (mm).
+# These are sanity bounds — GRBL's own soft limits are the real enforcement,
+# but catching obviously wrong values before they hit the machine is safer.
+SOFT_LIMITS = {
+    "X": (-1.0, 410.0),
+    "Y": (-1.0, 310.0),
+    "Z": (-1.0, 120.0),
+}
+
+# Commands that are always allowed (GRBL system, status, override)
+_SAFE_COMMANDS = re.compile(
+    r"^(\$[A-Za-z$#=0-9]|[?!~]|\x18)"  # $H, $$, $X, $#, $N=, ?, !, ~, ctrl-X
+)
+
+# G-code words that set axis positions — used to check travel limits
+_AXIS_WORD = re.compile(r"([XYZ])\s*(-?[\d.]+)", re.IGNORECASE)
+
+# Dangerous commands that should be blocked or warned about
+_BLOCKED_PATTERNS = [
+    (re.compile(r"\$RST=\*", re.IGNORECASE), "Factory reset ($RST=*) blocked"),
+    (re.compile(r"\$RST=#", re.IGNORECASE), "Coordinate reset ($RST=#) blocked"),
+]
+
+
+def validate_gcode(command: str) -> Optional[str]:
+    """Validate a G-code command. Returns error string if invalid, None if OK."""
+    cmd = command.strip().upper()
+    if not cmd:
+        return "Empty command"
+
+    # GRBL system commands are always OK (except blocked ones)
+    for pattern, msg in _BLOCKED_PATTERNS:
+        if pattern.search(cmd):
+            return msg
+
+    if _SAFE_COMMANDS.match(cmd):
+        return None
+
+    # Check axis values against soft limits
+    for match in _AXIS_WORD.finditer(cmd):
+        axis = match.group(1).upper()
+        try:
+            value = float(match.group(2))
+        except ValueError:
+            continue
+        if axis in SOFT_LIMITS:
+            lo, hi = SOFT_LIMITS[axis]
+            # Allow relative moves (G91) to exceed — GRBL handles those.
+            # For absolute coordinates, flag obviously out-of-range values.
+            # We use a generous 2x multiplier to avoid false positives on
+            # relative moves (we can't always tell G90 vs G91 from one line).
+            generous_lo, generous_hi = lo - hi, hi * 2
+            if value < generous_lo or value > generous_hi:
+                return f"Axis {axis} value {value} far outside machine limits ({lo} to {hi})"
+
+    return None
+
+
+def validate_serial_port(port: str) -> Optional[str]:
+    """Validate that a serial port path looks legitimate. Returns error or None."""
+    # Must be a device path, not arbitrary file
+    if not port.startswith("/dev/") and not port.startswith("COM"):
+        return f"Invalid port: {port} (must be /dev/... or COM...)"
+    # Block obvious non-serial paths
+    if ".." in port:
+        return f"Invalid port path: {port}"
+    # Check it's actually a character device (Unix) or exists (Windows)
+    if port.startswith("/dev/") and os.path.exists(port):
+        if not os.stat(port).st_mode & 0o020000:  # S_IFCHR
+            # Not a character device — could be a regular file
+            import stat
+            if not stat.S_ISCHR(os.stat(port).st_mode):
+                return f"Not a character device: {port}"
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -88,6 +169,10 @@ class GRBLController:
     def connect(self, port: str) -> dict:
         if self._connected:
             self.disconnect()
+
+        port_err = validate_serial_port(port)
+        if port_err:
+            return {"ok": False, "error": port_err}
 
         try:
             ser = serial.Serial(port, self.BAUD_RATE, timeout=1)
@@ -196,6 +281,21 @@ class GRBLController:
         if not os.path.exists(filepath):
             return {"ok": False, "error": f"File not found: {filepath}"}
 
+        # Pre-validate all lines before streaming to the machine
+        try:
+            with open(filepath) as f:
+                for line_num, raw in enumerate(f, 1):
+                    line = raw.strip()
+                    if ";" in line:
+                        line = line[:line.index(";")].strip()
+                    if line and not line.startswith("(") and line != "%":
+                        err = validate_gcode(line)
+                        if err:
+                            return {"ok": False,
+                                    "error": f"Line {line_num}: {err} — file not sent"}
+        except Exception as e:
+            return {"ok": False, "error": f"Cannot read file: {e}"}
+
         self._job_stop.clear()
         self._job = JobStatus(filepath=filepath, running=True)
 
@@ -244,6 +344,15 @@ class GRBLController:
         axis = axis.upper()
         if axis not in ("X", "Y", "Z"):
             return {"ok": False, "error": "Axis must be X, Y, or Z"}
+        # Sanity check: jog distance shouldn't exceed full machine travel
+        if axis in SOFT_LIMITS:
+            lo, hi = SOFT_LIMITS[axis]
+            max_travel = hi - lo
+            if abs(distance_mm) > max_travel:
+                return {"ok": False,
+                        "error": f"Jog distance {distance_mm}mm exceeds {axis} travel ({max_travel}mm)"}
+        if feed_mmpm <= 0 or feed_mmpm > 10000:
+            return {"ok": False, "error": f"Feed rate {feed_mmpm} out of range (0-10000 mm/min)"}
         cmd = f"$J=G91 G21 {axis}{distance_mm:.3f} F{feed_mmpm:.0f}\n"
         self._write(cmd.encode())
         return {"ok": True, "command": cmd.strip()}
@@ -315,6 +424,9 @@ class GRBLController:
     def send_command(self, command: str) -> dict:
         if not self._connected:
             return {"ok": False, "error": "Not connected"}
+        err = validate_gcode(command)
+        if err:
+            return {"ok": False, "error": f"Command rejected: {err}"}
         cmd = command.strip() + "\n"
         self._write(cmd.encode())
         time.sleep(0.25)
